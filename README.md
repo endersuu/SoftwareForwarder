@@ -59,7 +59,7 @@ If we look at Pagerank equation (Ignore damping here, to make Pagerank calculati
 edge ![equation](https://latex.codecogs.com/gif.latex?\inline&space;(v_{co},&space;v_{m})) exists  
 e.g. ![equation](https://latex.codecogs.com/gif.latex?\inline&space;P_{2}(v_{2})&space;=&space;\frac{P_{1}(v_{1})}{1}&plus;\frac{P_{1}(v_{3})}{5})
 
-All the states A worker X needs to know
+All the states a worker X needs to know
 are ![equation](https://latex.codecogs.com/gif.latex?\inline&space;P_{n}(v_{co}))
 and ![equation](https://latex.codecogs.com/gif.latex?\inline&space;outdegree(v_{co}))
 . ![equation](https://latex.codecogs.com/gif.latex?\inline&space;outdegree(v_{co})) are constant,
