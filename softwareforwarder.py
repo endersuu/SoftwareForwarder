@@ -1,90 +1,75 @@
-import typing
+import base64
 import functools
-import time
+import logging
 import multiprocessing
 import multiprocessing.connection
+import pickle
+import time
+from typing import Tuple, Dict
 
 import requests
-
-import logging
 
 FORMAT = f"%(filename)-13s|%(funcName)-10s|%(lineno)-3d|%(message)s"
 logging.basicConfig(format=FORMAT)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class SoftwareForwarder(object):
+    """
+    SoftwareForwarder works in form of a decorator. The main purpose of SoftwareForwarder is to let function instances
+    easily and efficiently exchange states between each other.
+    """
+
     def __init__(self, url: str = 'http://172.31.20.160:8000'):
         self.url = url
+        # AWS lambda will try to reuse existed object that means code of __init__ may be skipped.
+        # All the code of init has to be static value. Dynamic code has to be moved to other method.
         self.pipe_rec_r, self.pipe_rec_s = None, None
         self.pipe_sen_r, self.pipe_sen_s = None, None
-
-        """
-        AWS lambda will try to reuse existed object that means code of __init__ may be skipped.
-        So, all the code of init has to be static value. Dynamic code has to be moved to other method. 
-        """
-        self.orignal_peers = None
+        self.original_peers = None
         self.peers = None
         self.puid = None
         self.uid = None
-        self.peers_orignal_peers_mapping = None
+        self.peers_original_peers_mapping = None
 
     def __call__(self, func):
         @functools.wraps(func)
         def wrapper(*args, **kw):
-            logger.info(f'-> decorator "{func.__name__}" start')
-
             self.pipe_rec_r, self.pipe_rec_s = multiprocessing.Pipe(duplex=False)
             self.pipe_sen_r, self.pipe_sen_s = multiprocessing.Pipe(duplex=False)
+
+            def sen(dst, msg):
+                self.pipe_sen_s.send((dst, msg))
+
+            def rec():
+                return self.pipe_rec_r.recv()
+
             # register
-            logger.debug('Before register request')
             response = requests.get(self.url + '/register/')
-            logger.debug('After register request')
-            self.orignal_peers: typing.Tuple[str] = tuple(response.json()['peers'])
-            self.peers = tuple(range(1, len(self.orignal_peers) + 1))
-            # self.peers = tuple(range(len(self.orignal_peers)))
+            logger.info('register finished')
+            self.original_peers: Tuple[str] = tuple(response.json()['peers'])
+            self.peers = tuple(range(1, len(self.original_peers) + 1))
             self.puid: str = response.json()['puid']
-            self.uid: int = self.orignal_peers.index(self.puid) + 1
-            self.peers_orignal_peers_mapping: typing.Dict[int, str] = dict(zip(self.peers, self.orignal_peers))
-            logger.debug(f'INIT: orignal_peers = {self.orignal_peers}\n'
-                         f'peers = {self.peers}\n'
-                         f'puid = {self.puid}\n'
-                         f'uid = {self.uid}\n'
-                         f'peers_orignal_peers_mapping = {self.peers_orignal_peers_mapping}')
+            self.uid: int = self.original_peers.index(self.puid) + 1
+            self.peers_original_peers_mapping: Dict[int, str] = dict(zip(self.peers, self.original_peers))
 
-            logger.debug(
-                f'get response from server {response}\norignal_peers = {self.orignal_peers}\npuid = {self.puid}')
-
-            # TODO I prefer to use threads here, but I haven't find the way to terminate threads in python
-            receive_process: multiprocessing.Process = multiprocessing.Process(target=self.receive,
-                                                                               args=(self.pipe_rec_s,))
-            send_process: multiprocessing.Process = multiprocessing.Process(target=self.send, args=(self.pipe_sen_r,))
+            receive_process = multiprocessing.Process(target=self.receive, args=(self.pipe_rec_s,))
+            send_process = multiprocessing.Process(target=self.send, args=(self.pipe_sen_r,))
             receive_process.start()
             send_process.start()
 
-            # update event variable
-            args[0].update({'pipe_rec': self.pipe_rec_r,
-                            'pipe_sen': self.pipe_sen_s,
+            args[0].update({'sen': sen,
+                            'rec': rec,
                             'uid': self.uid,
                             'peers': self.peers,
                             })
 
-            logger.debug('args = {}'.format(args))
-            time.sleep(1)
-
-            logger.info(f'-> function "{func.__name__}" start')
-            # execute user function
+            logger.info(f'user function "{func.__name__}" start')
             func_return = func(*args, **kw)
+            logger.info(f'user function "{func.__name__}" returned')
 
-            logger.info(f'-> after function "{func.__name__}" return')
-            time.sleep(1)
-            '''
-            check if msg_q_sen is empty
-            server is considered always up, so sending message is feasibly
-            and here will be no more msg produced by user process because it has already returned
-            '''
-            logger.debug(f'self.pipe_sen_r.poll() = {self.pipe_sen_r.poll()}')
+            # make sure pipe_sen_r is empty
             while self.pipe_sen_r.poll():
                 time.sleep(0.01)
 
@@ -94,7 +79,6 @@ class SoftwareForwarder(object):
             receive_process.join()
             send_process.join()
 
-            # test if process closed
             receive_process.close()
             send_process.close()
 
@@ -106,24 +90,23 @@ class SoftwareForwarder(object):
         return wrapper
 
     def receive(self, pipe_rec: multiprocessing.connection.Connection):
-        logger.debug(f'receive thread start!')
-        while True:
-            # TODO This infinitely get request will make uvicorn hard to terminate the connection.
-            response = requests.get(self.url + '/messages/', params={'src': self.puid})
-            logger.debug(f'receive():message = {response.json()}:{type(response.json())}')
-            msg = response.json()
-            logger.debug(f'receive(): client {self.puid} get msg: {msg}')
-
-            # already implicitly acquire mutex
-            pipe_rec.send(msg)
+        logger.info('receive() start!')
+        with requests.sessions.Session() as session:
+            while True:
+                # TODO This infinitely get request will make uvicorn hard to terminate
+                response = session.get(self.url + '/messages/', params={'src': self.puid})
+                msg: Tuple[int, Dict] = pickle.loads(base64.b64decode((response.json()['payload'].encode('utf8'))))
+                logger.debug(f'receive(): client {self.puid} get msg: {msg}')
+                pipe_rec.send(msg)  # already implicitly acquire mutex
 
     def send(self, pipe_sen: multiprocessing.connection.Connection):
-        logger.debug(f'send(): send thread start!')
-        while True:
-            logger.debug(f'send(): get message from msg_q_sen, message remain? {self.pipe_sen_r.poll()}')
-            msg_tuple: tuple = pipe_sen.recv()
-            # find dst and payload from msg
-            dst = self.peers_orignal_peers_mapping[msg_tuple[0]]
-            msg = {'payload': msg_tuple[1]}
-            logger.debug(f'send(): send message to {dst}: {msg}')
-            requests.post(self.url + '/messages/', params={'src': self.puid, 'dst': dst}, json=msg)
+        logger.info('send() start!')
+        with requests.sessions.Session() as session:
+            while True:
+                msg_tuple: tuple = pipe_sen.recv()
+                # find dst and payload from msg
+                dst = self.peers_original_peers_mapping[msg_tuple[0]]
+                # TODO haven't found the way to transfer binary data through fastAPI
+                msg = {'payload': base64.b64encode(pickle.dumps(msg_tuple[1])).decode('utf8')}
+                logger.debug(f'send(): send message to {dst}: {msg}')
+                session.post(self.url + '/messages/', params={'dst': dst}, json=msg)
